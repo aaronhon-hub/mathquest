@@ -6307,7 +6307,7 @@ const LS_ZOHO_KEY    = 'mq_zoho_info_v3';
 // Find it in: Catalyst console → Serverless → Functions → api-service → Function URL
 // Example: 'https://mathquest-875627827.catalystserverless.com/server/api-service'
 // Leave as '' if the client and function share the same domain (traditional hosting).
-const CATALYST_API = 'https://mathquest-919188578.development.catalystserverless.com/server/api-service/';
+const CATALYST_API = '';
 
 const ProfileStore = (() => {
   // In-memory state
@@ -6443,7 +6443,13 @@ const ProfileStore = (() => {
 
   function _loadLocal() {
     try {
-      _characters = JSON.parse(localStorage.getItem(LS_CHARS_KEY) || '[]');
+      const raw = JSON.parse(localStorage.getItem(LS_CHARS_KEY) || '[]');
+      // Purge any malformed entries saved by the old GameStore Promise bug
+      _characters = raw.filter(c => c && typeof c === 'object' && typeof c.name === 'string' && c.name.length > 0);
+      if (_characters.length !== raw.length) {
+        // Malformed entries found — clean up localStorage immediately
+        try { localStorage.setItem(LS_CHARS_KEY, JSON.stringify(_characters)); } catch {}
+      }
       _activeId   = localStorage.getItem(LS_ACTIVE_KEY) || (_characters[0]?.id || null);
       _zohoName   = localStorage.getItem(LS_ZOHO_KEY) || null;
     } catch { _characters = []; }
@@ -6498,14 +6504,15 @@ class GameStore{
   static _profile=null;
   static get profile(){
     if(!this._profile)this._profile=ProfileStore.getActive();
-    if(!this._profile)this._profile=ProfileStore.create('Student');
-    return this._profile;
+    // ProfileStore.create() is now async — never call it synchronously here.
+    // After ProfileStore.init() completes a profile will always exist for Zoho users.
+    return this._profile; // may be null before init completes — callers must handle
   }
   static refresh(){this._profile=ProfileStore.getActive();}
-  static isUnlocked(id){return this.profile.unlockedLevels?.includes(id)??false}
-  static getStars(id){return this.profile.starsByLevel?.[id]??0}
+  static isUnlocked(id){return this.profile?.unlockedLevels?.includes(id)??false}
+  static getStars(id){return this.profile?.starsByLevel?.[id]??0}
   static recordResult(session,levelDef){
-    const p=this.profile;
+    const p=this.profile;if(!p)return;
     p.starsByLevel=p.starsByLevel||{};
     p.starsByLevel[session.levelId]=Math.max(p.starsByLevel[session.levelId]??0,session.stars);
     if(session.passed&&levelDef.nextLevelId){
@@ -6522,7 +6529,8 @@ class GameStore{
     return acc>=.98&&r<.45?3:acc>=.94&&r<.65?2:1;
   }
   static resetAll(){
-    const p=this.profile;p.unlockedLevels=['K1L1'];p.starsByLevel={};p.sessions=[];
+    const p=this.profile;if(!p)return; // guard: no profile yet
+    p.unlockedLevels=['K1L1'];p.starsByLevel={};p.sessions=[];
     ProfileStore.save(p);this._profile=null;
   }
 }
@@ -6706,13 +6714,13 @@ class MainMenuScene extends ct.Scene{
   }
   startArcade(){
     const active=ProfileStore.getActive();
-    if(!active){ProfileStore.create('Student');GameStore.refresh();}
+    if(!active){alert('Please create a character first!');return;}
     this.cameras.main.fadeOut(200,0,0,0);
     this.time.delayedCall(220,()=>this.scene.start('BonusScene'));
   }
   startDungeon(){
     const active=ProfileStore.getActive();
-    if(!active){ProfileStore.create('Student');GameStore.refresh();}
+    if(!active){alert('Please create a character first!');return;}
     this.cameras.main.fadeOut(200,0,0,0);
     const prologueSeen=active&&localStorage.getItem(`mq_prologue_seen_${active?.id}`);
     const d1beaten=active?._dungeonsBeaten?.includes('dungeon_1');
