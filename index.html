@@ -6702,7 +6702,7 @@ class MainMenuScene extends ct.Scene{
     if(!name)return;
     // Check for duplicate name within this account
     const existing=ProfileStore.getAll();
-    if(existing.some(c=>c.name.toLowerCase()===name.toLowerCase())){
+    if(existing.some(c=>c.name?.toLowerCase()===name.toLowerCase())){
       this._showFormError('You already have a character with that name!');return;
     }
     const avatarIds=Object.keys(AVATAR_COLORS);const aid=avatarIds[this.editAvatarIdx%avatarIds.length];
