@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script src="https://mathquest-919188578.development.catalystserverless.com/__catalyst/sdk/init.js"></script>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MathQuest: Realm of Numbers</title>
@@ -6319,26 +6318,28 @@ const ProfileStore = (() => {
   let _syncing     = false;
   let _dirty       = false;
 
-  // ── Boot: get Zoho user identity then fetch characters ──
+  // ── Boot: identify user via /api/whoami then fetch characters ──
   async function init() {
     _loadLocal();
-    // Get the logged-in Zoho user from the Catalyst Web SDK (loaded via __catalyst/sdk/init.js)
-    // This gives us the user_id to pass to the API instead of relying on session cookies
+    // Call /api/whoami with credentials so the function can read the Catalyst session cookie.
+    // This works cross-domain because Catalyst Authorized Domains sets CORS + credentials headers.
     try {
-      const user = await window.catalyst.auth.getCurrentUser();
-      _zohoUid  = String(user.user_id);
-      _zohoName = user.first_name || user.email_id?.split('@')[0] || null;
-      try {
-        localStorage.setItem('mq_zoho_uid_v3', _zohoUid);
-        if (_zohoName) localStorage.setItem(LS_ZOHO_KEY, _zohoName);
-      } catch {}
-    } catch {
-      // Web SDK not available or not logged in — fall back to cached uid
-      _zohoUid  = localStorage.getItem('mq_zoho_uid_v3') || null;
-      _zohoName = localStorage.getItem(LS_ZOHO_KEY) || null;
-    }
+      const res = await fetch(CATALYST_API+'/api/whoami', { credentials: 'include' });
+      if (res.ok) {
+        const user = await res.json();
+        _zohoUid  = String(user.user_id);
+        _zohoName = user.first_name || user.email_id?.split('@')[0] || null;
+        try {
+          localStorage.setItem('mq_zoho_uid_v3', _zohoUid);
+          if (_zohoName) localStorage.setItem(LS_ZOHO_KEY, _zohoName);
+        } catch {}
+      }
+    } catch {}
+    // Fall back to cached uid if whoami failed
+    if (!_zohoUid) _zohoUid  = localStorage.getItem('mq_zoho_uid_v3') || null;
+    if (!_zohoName) _zohoName = localStorage.getItem(LS_ZOHO_KEY) || null;
     if (!_zohoUid) return { zohoName: _zohoName, characters: _characters };
-    // Fetch characters from server using uid as identifier
+    // Fetch characters from server
     try {
       const res = await fetch(CATALYST_API+'/api/characters?zoho_uid='+encodeURIComponent(_zohoUid));
       if (!res.ok) throw new Error('API ' + res.status);
@@ -6350,7 +6351,7 @@ const ProfileStore = (() => {
         _activeId = _characters[0]?.id || null;
       }
       _saveLocal();
-      for (const c of localOnly) { if (c.name) await _pushNew(c); }
+      for (const c of localOnly) { if (c.name) _pushNew(c); } // fire-and-forget
     } catch {
       if (_characters.length === 0) _characters = [];
     }
@@ -6378,23 +6379,14 @@ const ProfileStore = (() => {
     _syncToServer(profile); // fire-and-forget
   }
 
-  // Create a new character (async — calls server)
-  async function create(name, avatarId = 'hero_1') {
+  // Create a new character — saves locally immediately, syncs to server in background
+  function create(name, avatarId = 'hero_1') {
     const profile = _blankProfile(name, avatarId);
-    try {
-      const res = await fetch(CATALYST_API+'/api/characters', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ ...profile, zoho_uid: _zohoUid, zoho_name: _zohoName })
-      });
-      if (res.ok) {
-        const saved = await res.json();
-        profile.id = saved.id; // replace temp id with server ROWID
-      }
-    } catch { /* offline — will sync next time */ }
     _characters.push(profile);
     _activeId = profile.id;
     _saveLocal();
+    // Fire-and-forget server push — UI does not wait for this
+    _pushNew(profile);
     return profile;
   }
 
@@ -6458,10 +6450,16 @@ const ProfileStore = (() => {
   function _loadLocal() {
     try {
       const raw = JSON.parse(localStorage.getItem(LS_CHARS_KEY) || '[]');
-      // Purge any malformed entries saved by the old GameStore Promise bug
-      _characters = raw.filter(c => c && typeof c === 'object' && typeof c.name === 'string' && c.name.length > 0);
+      // Filter malformed entries, then deduplicate by name (keep newest per name)
+      const valid = raw.filter(c => c && typeof c === 'object' && typeof c.name === 'string' && c.name.length > 0);
+      const seen = new Map();
+      for (const c of valid) {
+        const key = c.name.toLowerCase();
+        const existing = seen.get(key);
+        if (!existing || (c.updated_at||'') >= (existing.updated_at||'')) seen.set(key, c);
+      }
+      _characters = Array.from(seen.values());
       if (_characters.length !== raw.length) {
-        // Malformed entries found — clean up localStorage immediately
         try { localStorage.setItem(LS_CHARS_KEY, JSON.stringify(_characters)); } catch {}
       }
       _activeId   = localStorage.getItem(LS_ACTIVE_KEY) || (_characters[0]?.id || null);
@@ -6697,7 +6695,7 @@ class MainMenuScene extends ct.Scene{
     // Re-schedule refresh for blinking cursor
     this.time.delayedCall(500,()=>{if(this.mode==='creating')this.buildCreationForm();});
   }
-  async finishCreate(){
+  finishCreate(){
     const name=this.editName.trim();
     if(!name)return;
     // Check for duplicate name within this account
@@ -6706,7 +6704,7 @@ class MainMenuScene extends ct.Scene{
       this._showFormError('You already have a character with that name!');return;
     }
     const avatarIds=Object.keys(AVATAR_COLORS);const aid=avatarIds[this.editAvatarIdx%avatarIds.length];
-    await ProfileStore.create(name,aid);
+    ProfileStore.create(name,aid);
     GameStore.refresh();this.cancelCreate();
   }
   _showFormError(msg){
