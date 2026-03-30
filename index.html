@@ -6301,6 +6301,14 @@ const LS_CHARS_KEY   = 'mq_characters_v3';
 const LS_ACTIVE_KEY  = 'mq_active_char_v3';
 const LS_ZOHO_KEY    = 'mq_zoho_info_v3';
 
+// ── Catalyst function base URL ────────────────────────────────────────────────
+// When hosted on Slate the game is on a different domain from the API function.
+// Set this to your full Catalyst function URL (no trailing slash).
+// Find it in: Catalyst console → Serverless → Functions → api-service → Function URL
+// Example: 'https://mathquest-875627827.catalystserverless.com/server/api-service'
+// Leave as '' if the client and function share the same domain (traditional hosting).
+const CATALYST_API = 'https://mathquest-919188578.development.catalystserverless.com/server/api-service/';
+
 const ProfileStore = (() => {
   // In-memory state
   let _characters  = [];   // all characters for this Zoho user
@@ -6313,7 +6321,7 @@ const ProfileStore = (() => {
   async function init() {
     _loadLocal();
     try {
-      const res = await fetch('/api/characters');
+      const res = await fetch(CATALYST_API+'/api/characters');
       if (!res.ok) throw new Error('API ' + res.status);
       const data = await res.json();
       _zohoName   = data.zoho_name  || null;
@@ -6361,7 +6369,7 @@ const ProfileStore = (() => {
   async function create(name, avatarId = 'hero_1') {
     const profile = _blankProfile(name, avatarId);
     try {
-      const res = await fetch('/api/characters', {
+      const res = await fetch(CATALYST_API+'/api/characters', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(profile)
@@ -6382,13 +6390,13 @@ const ProfileStore = (() => {
     _characters = _characters.filter(c => c.id !== id);
     if (_activeId === id) _activeId = _characters[0]?.id || null;
     _saveLocal();
-    try { await fetch('/api/characters/' + id, { method: 'DELETE' }); } catch {}
+    try { await fetch(CATALYST_API+'/api/characters/'+id,{method:'DELETE'}); } catch {}
   }
 
   // Teacher: get all characters for all users
   async function getAllFromServer() {
     try {
-      const res = await fetch('/api/profiles');
+      const res = await fetch(CATALYST_API+'/api/profiles');
       if (!res.ok) throw new Error('API ' + res.status);
       return await res.json();
     } catch {
@@ -6398,7 +6406,7 @@ const ProfileStore = (() => {
 
   // Teacher: reset a character by server id
   async function resetProfile(id) {
-    try { await fetch('/api/profiles/' + id, { method: 'DELETE' }); } catch {}
+    try { await fetch(CATALYST_API+'/api/profiles/'+id,{method:'DELETE'}); } catch {}
     // Also clear locally if it's one of ours
     _characters = _characters.filter(c => c.id !== id);
     _saveLocal();
@@ -6450,7 +6458,7 @@ const ProfileStore = (() => {
     if (_syncing) { _dirty = true; return; }
     _syncing = true; _dirty = false;
     try {
-      await fetch('/api/characters/' + profile.id, {
+      await fetch(CATALYST_API+'/api/characters/'+profile.id,{
         method:  'PUT',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(profile)
@@ -6462,7 +6470,7 @@ const ProfileStore = (() => {
 
   async function _pushNew(profile) {
     try {
-      const res = await fetch('/api/characters', {
+      const res = await fetch(CATALYST_API+'/api/characters', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(profile)
