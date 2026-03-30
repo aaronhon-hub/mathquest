@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script src="https://mathquest-919188578.development.catalystserverless.com/__catalyst/sdk/init.js"></script>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MathQuest: Realm of Numbers</title>
@@ -6313,32 +6314,44 @@ const ProfileStore = (() => {
   // In-memory state
   let _characters  = [];   // all characters for this Zoho user
   let _activeId    = null; // ROWID of the active character
+  let _zohoUid     = null; // Zoho user_id (passed to API instead of session cookie)
   let _zohoName    = null; // Zoho first name for pre-populating new character form
   let _syncing     = false;
   let _dirty       = false;
 
-  // ── Boot: fetch from server, merge with localStorage ─────
+  // ── Boot: get Zoho user identity then fetch characters ──
   async function init() {
     _loadLocal();
+    // Get the logged-in Zoho user from the Catalyst Web SDK (loaded via __catalyst/sdk/init.js)
+    // This gives us the user_id to pass to the API instead of relying on session cookies
     try {
-      const res = await fetch(CATALYST_API+'/api/characters');
+      const user = await window.catalyst.auth.getCurrentUser();
+      _zohoUid  = String(user.user_id);
+      _zohoName = user.first_name || user.email_id?.split('@')[0] || null;
+      try {
+        localStorage.setItem('mq_zoho_uid_v3', _zohoUid);
+        if (_zohoName) localStorage.setItem(LS_ZOHO_KEY, _zohoName);
+      } catch {}
+    } catch {
+      // Web SDK not available or not logged in — fall back to cached uid
+      _zohoUid  = localStorage.getItem('mq_zoho_uid_v3') || null;
+      _zohoName = localStorage.getItem(LS_ZOHO_KEY) || null;
+    }
+    if (!_zohoUid) return { zohoName: _zohoName, characters: _characters };
+    // Fetch characters from server using uid as identifier
+    try {
+      const res = await fetch(CATALYST_API+'/api/characters?zoho_uid='+encodeURIComponent(_zohoUid));
       if (!res.ok) throw new Error('API ' + res.status);
       const data = await res.json();
-      _zohoName   = data.zoho_name  || null;
       const remote = data.characters || [];
-      // Merge: server is authoritative for each character,
-      // but keep any local chars that haven't synced yet (no server id)
       const localOnly = _characters.filter(c => !c.id || !remote.find(r => r.id === c.id));
       _characters = [...remote, ...localOnly];
-      // Ensure active id points to a real character
       if (!_characters.find(c => c.id === _activeId)) {
         _activeId = _characters[0]?.id || null;
       }
       _saveLocal();
-      // Push any unsynced local characters to server
       for (const c of localOnly) { if (c.name) await _pushNew(c); }
     } catch {
-      // Offline — localStorage only
       if (_characters.length === 0) _characters = [];
     }
     return { zohoName: _zohoName, characters: _characters };
@@ -6372,7 +6385,7 @@ const ProfileStore = (() => {
       const res = await fetch(CATALYST_API+'/api/characters', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(profile)
+        body:    JSON.stringify({ ...profile, zoho_uid: _zohoUid, zoho_name: _zohoName })
       });
       if (res.ok) {
         const saved = await res.json();
@@ -6413,6 +6426,7 @@ const ProfileStore = (() => {
   }
 
   function getZohoName() { return _zohoName; }
+  function getZohoUid()  { return _zohoUid; }
 
   // ── Private helpers ──────────────────────────────────────
   function _blankProfile(name, avatarId) {
@@ -6479,7 +6493,7 @@ const ProfileStore = (() => {
       const res = await fetch(CATALYST_API+'/api/characters', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(profile)
+        body:    JSON.stringify({ ...profile, zoho_uid: _zohoUid, zoho_name: _zohoName })
       });
       if (res.ok) {
         const saved = await res.json();
@@ -6494,7 +6508,7 @@ const ProfileStore = (() => {
   }
 
   return { init, getActive, getAll, setActive, save, create,
-           deleteProfile, getAllFromServer, resetProfile, getZohoName };
+           deleteProfile, getAllFromServer, resetProfile, getZohoName, getZohoUid };
 })();
 
 // ============================================================
