@@ -6294,68 +6294,86 @@ return new `+this.key+`();
  */p.exports={Format:t(69429),Pad:t(76400),RemoveAt:t(76872),Reverse:t(8051),UppercaseFirst:t(40587),UUID:t(76583)}}},Y={};function K(p){var S=Y[p];if(S!==void 0)return S.exports;var t=Y[p]={exports:{}};return X[p](t,t.exports,K),t.exports}K.g=function(){if(typeof globalThis=="object")return globalThis;try{return this||new Function("return this")()}catch{if(typeof window=="object")return window}}();var Z=K(92491);return Z})())})(se);var oe=se.exports;const ct=ae(oe);
 
 // ============================================================
-// PROFILE STORE — server-backed, localStorage write-through
-// One Zoho account → multiple game characters (profiles)
+// PROFILE STORE — localStorage write-through + Upstash cloud sync
+// No user identity required — shared password + character-name slot
 // ============================================================
-const LS_CHARS_KEY   = 'mq_characters_v3';
-const LS_ACTIVE_KEY  = 'mq_active_char_v3';
-const LS_ZOHO_KEY    = 'mq_zoho_info_v3';
+const LS_CHARS_KEY  = 'mq_characters_v3';
+const LS_ACTIVE_KEY = 'mq_active_char_v3';
+const LS_SYNC_PW    = 'mq_sync_pw';
 
-// ── Catalyst function base URL ────────────────────────────────────────────────
-// When hosted on Slate the game is on a different domain from the API function.
-// Set this to your full Catalyst function URL (no trailing slash).
-// Find it in: Catalyst console → Serverless → Functions → api-service → Function URL
-// Example: 'https://mathquest-875627827.catalystserverless.com/server/api-service'
-// Leave as '' if the client and function share the same domain (traditional hosting).
-const CATALYST_API = 'https://mathquest-919188578.development.catalystserverless.com/server/api-service';
+// ── Catalyst sync function URLs ───────────────────────────────────────────────
+// Set these to your deployed Catalyst Advanced IO function URLs.
+// Find them in: Catalyst console → Serverless → Functions → [name] → Function URL
+// Switch to production URL (remove "development.") when promoting to prod.
+const SYNC_PUSH_URL = 'https://mathquest-919188578.development.catalystserverless.com/server/sync-push';
+const SYNC_PULL_URL = 'https://mathquest-919188578.development.catalystserverless.com/server/sync-pull';
 
 const ProfileStore = (() => {
-  // In-memory state
-  let _characters  = [];   // all characters for this Zoho user
-  let _activeId    = null; // ROWID of the active character
-  let _zohoUid     = null; // Zoho user_id (passed to API instead of session cookie)
-  let _zohoName    = null; // Zoho first name for pre-populating new character form
-  let _syncing     = false;
-  let _dirty       = false;
+  let _characters = [];
+  let _activeId   = null;
+  let _password   = null; // shared classroom sync password
 
-  // ── Boot: identify user via /api/whoami then fetch characters ──
+  // Derive a safe Redis slot key from a character name
+  function _slotKey(name) {
+    return 'mq-' + name.toLowerCase()
+      .replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')
+      .replace(/^-|-$/g, '').slice(0, 40) || 'player';
+  }
+
+  // ── Boot: load localStorage immediately, pull from cloud in background ────
   async function init() {
     _loadLocal();
-    // Call /api/whoami with credentials so the function can read the Catalyst session cookie.
-    // This works cross-domain because Catalyst Authorized Domains sets CORS + credentials headers.
-    try {
-      const res = await fetch(CATALYST_API+'/api/whoami', { credentials: 'include' });
-      if (res.ok) {
-        const user = await res.json();
-        _zohoUid  = String(user.user_id);
-        _zohoName = user.first_name || user.email_id?.split('@')[0] || null;
-        try {
-          localStorage.setItem('mq_zoho_uid_v3', _zohoUid);
-          if (_zohoName) localStorage.setItem(LS_ZOHO_KEY, _zohoName);
-        } catch {}
-      }
-    } catch {}
-    // Fall back to cached uid if whoami failed
-    if (!_zohoUid) _zohoUid  = localStorage.getItem('mq_zoho_uid_v3') || null;
-    if (!_zohoName) _zohoName = localStorage.getItem(LS_ZOHO_KEY) || null;
-    if (!_zohoUid) return { zohoName: _zohoName, characters: _characters };
-    // Fetch characters from server
-    try {
-      const res = await fetch(CATALYST_API+'/api/characters?zoho_uid='+encodeURIComponent(_zohoUid));
-      if (!res.ok) throw new Error('API ' + res.status);
-      const data = await res.json();
-      const remote = data.characters || [];
-      const localOnly = _characters.filter(c => !c.id || !remote.find(r => r.id === c.id));
-      _characters = [...remote, ...localOnly];
-      if (!_characters.find(c => c.id === _activeId)) {
-        _activeId = _characters[0]?.id || null;
-      }
-      _saveLocal();
-      for (const c of localOnly) { if (c.name) _pushNew(c); } // fire-and-forget
-    } catch {
-      if (_characters.length === 0) _characters = [];
+    _password = localStorage.getItem(LS_SYNC_PW) || null;
+    if (_password && _characters.length > 0) {
+      _pullAll().then(() => {
+        window.dispatchEvent(new CustomEvent('mq_profiles_updated'));
+      }).catch(() => {});
     }
-    return { zohoName: _zohoName, characters: _characters };
+    return { characters: _characters };
+  }
+
+  // Pull all local characters from Upstash and merge (server wins if newer)
+  async function _pullAll() {
+    if (!_password) return;
+    await Promise.all(_characters.map(c =>
+      _syncPull(c.name).then(remote => {
+        if (!remote) return;
+        const localIdx = _characters.findIndex(ch => ch.id === c.id);
+        if (localIdx < 0) return;
+        const local = _characters[localIdx];
+        if ((remote.updated_at || '') > (local.updated_at || '')) {
+          _characters[localIdx] = { ...remote, id: local.id }; // preserve local id
+          _saveLocal();
+        }
+      }).catch(() => {})
+    ));
+  }
+
+  // Pull one character's cloud snapshot by name
+  async function _syncPull(name) {
+    if (!_password) return null;
+    try {
+      const res = await fetch(SYNC_PULL_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: _password, slot: _slotKey(name) })
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.data || null;
+    } catch { return null; }
+  }
+
+  // Push one character to Upstash (fire-and-forget)
+  async function _syncPush(profile) {
+    if (!_password || !profile?.name) return;
+    try {
+      await fetch(SYNC_PUSH_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: _password, slot: _slotKey(profile.name), data: profile })
+      });
+    } catch {}
   }
 
   function getActive() {
@@ -6367,60 +6385,58 @@ const ProfileStore = (() => {
   function setActive(id) {
     _activeId = id;
     try { localStorage.setItem(LS_ACTIVE_KEY, id); } catch {}
+    // Pull fresh cloud data for newly active character
+    const active = _characters.find(c => c.id === id);
+    if (active && _password) {
+      _syncPull(active.name).then(remote => {
+        if (!remote) return;
+        const localIdx = _characters.findIndex(c => c.id === id);
+        if (localIdx < 0) return;
+        const local = _characters[localIdx];
+        if ((remote.updated_at || '') > (local.updated_at || '')) {
+          _characters[localIdx] = { ...remote, id: local.id };
+          _saveLocal();
+          window.dispatchEvent(new CustomEvent('mq_profiles_updated'));
+        }
+      }).catch(() => {});
+    }
   }
 
-  // Synchronous write-through save
+  // Write-through save: localStorage immediately, Upstash in background
   function save(profile) {
     if (!profile) return;
     profile.updated_at = new Date().toISOString();
     const idx = _characters.findIndex(c => c.id === profile.id);
     if (idx >= 0) _characters[idx] = profile; else _characters.push(profile);
     _saveLocal();
-    _syncToServer(profile); // fire-and-forget
+    _syncPush(profile); // fire-and-forget
   }
 
-  // Create a new character — saves locally immediately, syncs to server in background
+  // Create new character — local immediately, cloud in background
   function create(name, avatarId = 'hero_1') {
     const profile = _blankProfile(name, avatarId);
     _characters.push(profile);
     _activeId = profile.id;
     _saveLocal();
-    // Fire-and-forget server push — UI does not wait for this
-    _pushNew(profile);
+    _syncPush(profile);
     return profile;
   }
 
-  // Delete a character
-  async function deleteProfile(id) {
+  // Delete character — local only (cloud slot orphaned, safe)
+  function deleteProfile(id) {
     _characters = _characters.filter(c => c.id !== id);
     if (_activeId === id) _activeId = _characters[0]?.id || null;
     _saveLocal();
-    try { await fetch(CATALYST_API+'/api/characters/'+id,{method:'DELETE'}); } catch {}
   }
 
-  // Teacher: get all characters for all users
-  async function getAllFromServer() {
-    try {
-      const res = await fetch(CATALYST_API+'/api/profiles');
-      if (!res.ok) throw new Error('API ' + res.status);
-      return await res.json();
-    } catch {
-      return _characters;
-    }
+  function setPassword(pw) {
+    _password = pw;
+    try { localStorage.setItem(LS_SYNC_PW, pw); } catch {}
   }
 
-  // Teacher: reset a character by server id
-  async function resetProfile(id) {
-    try { await fetch(CATALYST_API+'/api/profiles/'+id,{method:'DELETE'}); } catch {}
-    // Also clear locally if it's one of ours
-    _characters = _characters.filter(c => c.id !== id);
-    _saveLocal();
-  }
+  function getPassword() { return _password; }
 
-  function getZohoName() { return _zohoName; }
-  function getZohoUid()  { return _zohoUid; }
-
-  // ── Private helpers ──────────────────────────────────────
+  // ── Private helpers ───────────────────────────────────────
   function _blankProfile(name, avatarId) {
     return {
       id:              'local_' + Date.now().toString(36),
@@ -6443,70 +6459,29 @@ const ProfileStore = (() => {
     try {
       localStorage.setItem(LS_CHARS_KEY,  JSON.stringify(_characters));
       localStorage.setItem(LS_ACTIVE_KEY, _activeId || '');
-      if (_zohoName) localStorage.setItem(LS_ZOHO_KEY, _zohoName);
     } catch {}
   }
 
   function _loadLocal() {
     try {
       const raw = JSON.parse(localStorage.getItem(LS_CHARS_KEY) || '[]');
-      // Filter malformed entries, then deduplicate by name (keep newest per name)
       const valid = raw.filter(c => c && typeof c === 'object' && typeof c.name === 'string' && c.name.length > 0);
       const seen = new Map();
       for (const c of valid) {
         const key = c.name.toLowerCase();
         const existing = seen.get(key);
-        if (!existing || (c.updated_at||'') >= (existing.updated_at||'')) seen.set(key, c);
+        if (!existing || (c.updated_at || '') >= (existing.updated_at || '')) seen.set(key, c);
       }
       _characters = Array.from(seen.values());
       if (_characters.length !== raw.length) {
         try { localStorage.setItem(LS_CHARS_KEY, JSON.stringify(_characters)); } catch {}
       }
-      _activeId   = localStorage.getItem(LS_ACTIVE_KEY) || (_characters[0]?.id || null);
-      _zohoName   = localStorage.getItem(LS_ZOHO_KEY) || null;
+      _activeId = localStorage.getItem(LS_ACTIVE_KEY) || (_characters[0]?.id || null);
     } catch { _characters = []; }
   }
 
-  async function _syncToServer(profile) {
-    if (!profile?.id || String(profile.id).startsWith('local_')) {
-      // Not yet on server — push as new
-      await _pushNew(profile);
-      return;
-    }
-    if (_syncing) { _dirty = true; return; }
-    _syncing = true; _dirty = false;
-    try {
-      await fetch(CATALYST_API+'/api/characters/'+profile.id,{
-        method:  'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(profile)
-      });
-    } catch { /* offline */ }
-    _syncing = false;
-    if (_dirty) _syncToServer(getActive());
-  }
-
-  async function _pushNew(profile) {
-    try {
-      const res = await fetch(CATALYST_API+'/api/characters', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ ...profile, zoho_uid: _zohoUid, zoho_name: _zohoName })
-      });
-      if (res.ok) {
-        const saved = await res.json();
-        const old_id = profile.id;
-        profile.id = saved.id;
-        const idx = _characters.findIndex(c => c.id === old_id);
-        if (idx >= 0) _characters[idx] = profile;
-        if (_activeId === old_id) _activeId = profile.id;
-        _saveLocal();
-      }
-    } catch {}
-  }
-
   return { init, getActive, getAll, setActive, save, create,
-           deleteProfile, getAllFromServer, resetProfile, getZohoName, getZohoUid };
+           deleteProfile, setPassword, getPassword };
 })();
 
 // ============================================================
@@ -6550,15 +6525,125 @@ class GameStore{
 // ============================================================
 // BOOT SCENE
 // ============================================================
+// ============================================================
+// SYNC PASSWORD SCENE — shown once on first run if no password cached
+// ============================================================
+class SyncPasswordScene extends ct.Scene {
+  constructor() { super({ key: 'SyncPasswordScene' }); }
+
+  create() {
+    const W = 800, H = 600;
+    let typed = '';
+
+    // Background
+    this.add.rectangle(W/2, H/2, W, H, 0x050a0f);
+
+    // Title
+    this.add.text(W/2, H/2 - 150, '⚔  MathQuest: Realm of Numbers', {
+      fontFamily: 'Arial Black', fontSize: '24px', color: '#ffcc44'
+    }).setOrigin(0.5);
+
+    this.add.text(W/2, H/2 - 108, 'Enter the class sync password to enable cross-device saving.', {
+      fontFamily: 'Arial', fontSize: '13px', color: '#667788'
+    }).setOrigin(0.5);
+
+    // Password input box (drawn with Graphics)
+    const boxGfx = this.add.graphics();
+    const bx = W/2 - 160, by = H/2 - 28, bw = 320, bh = 56;
+    boxGfx.fillStyle(0x08141e, 1);
+    boxGfx.fillRoundedRect(bx, by, bw, bh, 10);
+    boxGfx.lineStyle(2, 0x2255aa, 1);
+    boxGfx.strokeRoundedRect(bx, by, bw, bh, 10);
+
+    const pwDisplay = this.add.text(W/2, H/2, '', {
+      fontFamily: 'Arial', fontSize: '22px', color: '#aaddff', letterSpacing: 6
+    }).setOrigin(0.5);
+
+    // Blinking cursor
+    const cursor = this.add.text(W/2, H/2, '|', {
+      fontFamily: 'Arial', fontSize: '22px', color: '#4488ff'
+    }).setOrigin(0, 0.5);
+    this.time.addEvent({ delay: 500, loop: true, callback: () => cursor.setVisible(!cursor.visible) });
+
+    const statusTxt = this.add.text(W/2, H/2 + 52, 'Type password, press Enter to connect', {
+      fontFamily: 'Arial', fontSize: '12px', color: '#445566'
+    }).setOrigin(0.5);
+
+    // Connect button
+    const btn = this.add.text(W/2, H/2 + 90, '[  Connect  ]', {
+      fontFamily: 'Arial Black', fontSize: '15px', color: '#00dd77', backgroundColor: '#031a0d',
+      padding: { x: 16, y: 8 }
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    btn.on('pointerover',  () => btn.setColor('#44ffaa'));
+    btn.on('pointerout',   () => btn.setColor('#00dd77'));
+    btn.on('pointerdown',  () => typed.trim() ? this._proceed(typed.trim()) : this._shake(boxGfx, bx, by, bw, bh));
+
+    // Skip link
+    const skipTxt = this.add.text(W/2, H/2 + 140, 'Skip — play offline (progress saves to this device only)', {
+      fontFamily: 'Arial', fontSize: '11px', color: '#334455'
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    skipTxt.on('pointerover', () => skipTxt.setColor('#556677'));
+    skipTxt.on('pointerout',  () => skipTxt.setColor('#334455'));
+    skipTxt.on('pointerdown', () => this._proceed(''));
+
+    const updateDisplay = () => {
+      const dots = '●'.repeat(typed.length);
+      pwDisplay.setText(dots);
+      cursor.setX(W/2 + pwDisplay.width / 2 + 4);
+    };
+
+    this.input.keyboard.on('keydown', (e) => {
+      if (e.key === 'Enter') {
+        if (typed.trim()) this._proceed(typed.trim());
+        else this._shake(boxGfx, bx, by, bw, bh);
+      } else if (e.key === 'Backspace') {
+        typed = typed.slice(0, -1);
+        updateDisplay();
+        statusTxt.setText('Type password, press Enter to connect').setColor('#445566');
+      } else if (e.key.length === 1 && typed.length < 40) {
+        typed += e.key;
+        updateDisplay();
+        statusTxt.setText('Press Enter or click Connect').setColor('#336688');
+      }
+    });
+
+    updateDisplay();
+  }
+
+  _proceed(pw) {
+    if (pw) ProfileStore.setPassword(pw);
+    this.input.keyboard.removeAllListeners();
+    this.scene.start('MainMenuScene');
+  }
+
+  // Brief red flash on empty submit
+  _shake(gfx, bx, by, bw, bh) {
+    gfx.clear();
+    gfx.fillStyle(0x08141e, 1); gfx.fillRoundedRect(bx, by, bw, bh, 10);
+    gfx.lineStyle(2, 0xff3344, 1); gfx.strokeRoundedRect(bx, by, bw, bh, 10);
+    this.time.delayedCall(400, () => {
+      gfx.clear();
+      gfx.fillStyle(0x08141e, 1); gfx.fillRoundedRect(bx, by, bw, bh, 10);
+      gfx.lineStyle(2, 0x2255aa, 1); gfx.strokeRoundedRect(bx, by, bw, bh, 10);
+    });
+  }
+
+  shutdown() { this.input.keyboard.removeAllListeners(); }
+}
+
 class BootScene extends ct.Scene{
   constructor(){super({key:'BootScene'})}
   create(){
     // Phaser doesn't support async create() — use .then() so ProfileStore.init()
-    // fully resolves before MainMenuScene loads. Falls back to localStorage if offline.
+    // fully resolves before the next scene loads. Falls back to localStorage if offline.
     this._makeParticles();
     ProfileStore.init()
-      .catch(()=>{}) // offline — localStorage fallback already handled inside init()
-      .then(()=>this.scene.start('MainMenuScene'));
+      .catch(()=>{})
+      .then(()=>{
+        // Route through password screen only on first run (no cached password)
+        const hasPw = !!ProfileStore.getPassword();
+        this.scene.start(hasPw ? 'MainMenuScene' : 'SyncPasswordScene');
+      });
   }
   _makeParticles(){
     this.makeParticle('fx_star',10,10,g=>{g.fillStyle(0xffcc00,1);g.fillTriangle(5,0,7,4,3,4);g.fillTriangle(5,10,7,6,3,6);g.fillTriangle(0,4,4,3,4,7);g.fillTriangle(10,4,6,3,6,7);g.fillStyle(0xff8800,1);g.fillCircle(5,5,2)});
@@ -6593,6 +6678,10 @@ class MainMenuScene extends ct.Scene{
       }
     });
     this.input.keyboard.on('keydown-R',()=>{GameStore.resetAll();this.scene.restart()});
+    // Refresh cards when background server sync completes after boot
+    this._onProfilesUpdated=()=>{this.buildProfileCards();};
+    window.addEventListener('mq_profiles_updated',this._onProfilesUpdated);
+    this.events.once('shutdown',()=>window.removeEventListener('mq_profiles_updated',this._onProfilesUpdated));
     this.buildUI();
     this.cameras.main.fadeIn(400,0,0,0);
   }
@@ -6658,7 +6747,7 @@ class MainMenuScene extends ct.Scene{
   startCreateProfile(){
     this.mode='creating';
     // Pre-populate with Zoho name if available
-    this.editName=ProfileStore.getZohoName()||'';
+    this.editName='';
     this.editAvatarIdx=0;
     this.buildCreationForm();
   }
@@ -12009,7 +12098,7 @@ class TeacherScene extends ct.Scene{
     // Loading indicator
     const loadingTxt=this.add.text(400,200,'Loading profiles from server...',{fontFamily:'Arial',fontSize:'13px',color:'#445566'}).setOrigin(.5);
     let profiles=[];
-    try{profiles=await ProfileStore.getAllFromServer();}catch{profiles=ProfileStore.getAll();}
+    try{profiles=ProfileStore.getAll();}catch{profiles=[];}
     loadingTxt.destroy();
     if(profiles.length===0){this.add.text(400,200,'No student profiles found.',{fontFamily:'Arial',fontSize:'14px',color:'#556677'}).setOrigin(.5);}
     else{
@@ -12043,7 +12132,7 @@ class TeacherScene extends ct.Scene{
         const rb=this.add.text(730,y+22,'[Reset]',{fontFamily:'Arial',fontSize:'10px',color:'#ff4444'}).setOrigin(1,.5).setInteractive({useHandCursor:true});
         rb.on('pointerdown',async()=>{
           if(confirm('Delete ' + p.name + ' — this cannot be undone.')){
-            await ProfileStore.resetProfile(p.id);
+            await ProfileStore.deleteProfile(p.id);
             this.scene.restart();
           }
         });
@@ -12110,9 +12199,10 @@ class TeacherScene extends ct.Scene{
 // ============================================================
 new ct.Game({
   type:ct.AUTO,width:800,height:600,backgroundColor:'#000000',
-  scene:[BootScene,MainMenuScene,LevelSelectScene,LevelScene,DungeonSelectScene,PrologueScene,DungeonScene,ResultsScene,TeacherScene,BonusScene],
+  scene:[BootScene,SyncPasswordScene,MainMenuScene,LevelSelectScene,LevelScene,DungeonSelectScene,PrologueScene,DungeonScene,ResultsScene,TeacherScene,BonusScene],
   render:{antialias:false,pixelArt:true},fps:{target:60},parent:undefined
 });
+
 
 </script>
 </head>
